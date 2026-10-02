@@ -58,8 +58,11 @@ const CFG = {
     ARB: 'arbitrum',    DOGE: 'dogecoin',   PEPE: 'pepe',
     BTC: 'bitcoin',     ETH: 'ethereum',    RENDER: 'render-token',
     VET: 'vechain',     USUAL: 'usual',     USDT: 'tether',
-    XNO: 'nano'
+    XNO: 'nano',        DOT: 'polkadot'
   },
+
+  // Monedas que Gate.io lista con otro simbolo que el nuestro
+  GATE_SIMBOLO: { XNO: 'NANO' },
 
   EMAIL: {
     destinatario: 'alonso.nahuel.2002@gmail.com',
@@ -349,7 +352,7 @@ function traerPrecios(monedas) {
 
   var precios = {};
   var pendientes = monedas.slice();
-  const proveedores = [precios_Coinbase, precios_CoinGecko];
+  const proveedores = PROVEEDORES_PRECIOS;
 
   for (var i = 0; i < proveedores.length && pendientes.length; i++) {
     try {
@@ -358,11 +361,15 @@ function traerPrecios(monedas) {
       pendientes = pendientes.filter(function (m) { return !precios[m]; });
     } catch (err) {
       // Este proveedor falló entero (ej: 429, red caída). Seguimos con el resto.
+      Logger.log(proveedores[i].name + ' fallo: ' + err);
     }
   }
 
   return precios;   // puede venir incompleto
 }
+
+// En orden de prioridad; cada uno solo cotiza lo que el anterior no consiguio
+const PROVEEDORES_PRECIOS = [precios_Coinbase, precios_CoinGecko, precios_Gate];
 
 function precios_Coinbase(monedas) {
   const precios = {};
@@ -388,16 +395,21 @@ function precios_CoinGecko(monedas) {
     if (id) ids.push(id); else sinId.push(m);
   });
 
-  if (sinId.length) {
-    throw new Error('Falta el id de CoinGecko para: ' + sinId.join(', ') +
-                    '. Agregalo a CFG.COINGECKO.');
-  }
+  // Las que no tienen id se omiten (el llamador detecta que faltan), asi una
+  // sola moneda sin configurar no tumba la consulta de todas las demas.
+  if (sinId.length) Logger.log('Sin id de CoinGecko (agregalo a CFG.COINGECKO): ' + sinId.join(', '));
+  if (!ids.length) return {};
 
   const url = 'https://api.coingecko.com/api/v3/simple/price'
             + '?ids=' + encodeURIComponent(ids.join(','))
             + '&vs_currencies=usd';
 
-  const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  // CoinGecko devuelve 429 seguido desde las IPs compartidas de Apps Script: un reintento corto ayuda
+  var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  if (resp.getResponseCode() === 429) {
+    Utilities.sleep(2500);
+    resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  }
   if (resp.getResponseCode() !== 200) {
     throw new Error('HTTP ' + resp.getResponseCode());
   }
@@ -411,6 +423,23 @@ function precios_CoinGecko(monedas) {
   return precios;
 }
 
+// Par moneda/USDT por simbolo (no necesita id por moneda). USDT ~ USD.
+function precios_Gate(monedas) {
+  const precios = {};
+  monedas.forEach(function (m) {
+    try {
+      const resp = UrlFetchApp.fetch(
+        'https://api.gateio.ws/api/v4/spot/tickers?currency_pair=' + (CFG.GATE_SIMBOLO[m] || m) + '_USDT',
+        { muteHttpExceptions: true }
+      );
+      if (resp.getResponseCode() !== 200) return;
+      const d = JSON.parse(resp.getContentText());
+      if (d && d[0] && parseFloat(d[0].last) > 0) precios[m] = parseFloat(d[0].last);
+    } catch (err) { }
+  });
+  return precios;
+}
+
 function probarPrecios() {
   const hoja = SpreadsheetApp.getActive().getSheetByName(CFG.HOJA);
   const estado = procesar(leerMovimientos(hoja));
@@ -420,7 +449,7 @@ function probarPrecios() {
 
   var txt = 'Monedas a cotizar: ' + monedas.join(', ') + '\n\n';
 
-  [precios_Coinbase, precios_CoinGecko].forEach(function (fn) {
+  PROVEEDORES_PRECIOS.forEach(function (fn) {
     try {
       const p = fn(monedas);
       const ok = monedas.filter(function (m) { return p[m]; });
@@ -610,7 +639,7 @@ function prepararCartera(hoja) {
   const faltantes = abiertas.filter(function (c) { return !precios[c]; });
   if (faltantes.length) {
     throw new Error('Sin precio para: ' + faltantes.join(', ') +
-                    '. Revisa CFG.COINGECKO.');
+                    '. Revisa CFG.COINGECKO o corre "Probar fuentes de precios".');
   }
 
   return { movs: movs, estado: estado, usdt: usdt, abiertas: abiertas, precios: precios };
